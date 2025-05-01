@@ -1,0 +1,2 @@
+id	submitter_id	entity_type	entity_id	category	classification	created_datetime	status	notes
+9b7a9027-4a48-5e92-8fee-bd0c6498433d	12192	case	a45a91f6-55a5-4a5e-ba54-0ac0b4e87d8c	Alternate sample pipeline	Notification	2012-11-13T00:00:00	Approved	Biospecimens from this case belong to Batch 25 and were processed into analyte outside of the normal TCGA standardized laboratory pipeline.  Users should note that the resulting characterization data may exhibit features (e.g. batch effects) due to this difference.

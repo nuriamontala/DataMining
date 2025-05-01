@@ -1,0 +1,900 @@
+---
+title: "DMI - Hands on 3"
+author: "Núria Montalà & Clàudia Vicente"
+date: "Last update: `r format(Sys.time(), '%d %B, %Y')`"      
+output: 
+  html_document:
+    theme: cosmo
+    highligth: pygments
+    number_sections: true
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    fig_caption: true
+    keep_md: true
+editor_options: 
+  markdown: 
+    wrap: sentence
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, dev="svg", fig.width = 8, fig.height = 6, fig.align = 'center')
+```
+
+```{r intallpkg, include=FALSE}
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+```
+
+# Load necessary libraries
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+library(tidyverse)    
+library(tidymodels)   
+library(kknn)         
+library(ranger)       
+library(glmnet)      
+library(caret)
+library(car)
+library(randomForest)
+library(dplyr)
+library(MASS)
+library(crayon)
+library(corrplot)
+library(gridExtra)
+library(grid)
+library(knitr)
+library(leaps)
+library(plotROC)
+library(DescTools)
+library(reshape2)
+library(ggmosaic)
+library(rcompanion)
+library(formattable)
+library(ggplot2)
+```
+
+# Exercise 1
+
+[*Stamey et al. 1989*](https://www.auajournals.org/doi/10.1016/S0022-5347%2817%2941175-X) *examined the correlation between the level of prostate-specific antigen (PSA) and a number of clinical measures in men who were about to receive a radical prostatectomy.* *PSA is a protein that is produced by the prostate gland.* *The higher a man’s PSA level, the more likely it is that he has prostate cancer.*  *Use the [prostate cancer dataset](data/prostate_data.txt), described [here](data/prostate_description.txt), to train a model that predicts log of prostate-specific antigen.* *The variables are*\
+
+*- log cancer volume (lcavol)*\
+*- log prostate weight (lweight)*\
+*- age*\
+*- log of the amount of benign prostatic hyperplasia (lbph)*\
+*- seminal vesicle invasion (svi)*\
+*- log of capsular penetration (lcp)*\
+*- Gleason score (gleason)*\
+*- percent of Gleason scores 4 or 5 (pgg45)*\
+
+*You can ignore column named "train" and do your own data splitting.* *Do not forget to perform feature selection!*\
+*You can use as examples the [Linear Regression Lab](https://hastie.su.domains/ISLR2/Labs/Rmarkdown_Notebooks/Ch3-linreg-lab.html) and the section related to feature selection from [Lab: Linear Models and Regularization Methods](https://hastie.su.domains/ISLR2/Labs/Rmarkdown_Notebooks/Ch6-varselect-lab.html) from the book [An Introduction to Statistical Learning](https://www.statlearning.com/).*
+
+## Data preparation & Splitting
+
+::: {style="text-align: justify"}
+Before splitting the dataset into `training` and `testing` sets, an **exploratory data analysis** was conducted to examine **feature relationships** and detect potential **multicollinearity issues**.
+The analysis revealed some correlations between variables, particularly when comparing categorical vs. numerical features.
+However, since all Variance Inflation Factor (VIF) values remain below 5, indicating an acceptable level of multicollinearity, no variables were removed from the model.
+:::
+
+```{r}
+### Load dataset
+prostate_data <- read.delim("data/prostate_data.txt")
+prostate_data <- prostate_data %>% column_to_rownames(var = "X")
+
+# Drop the "train" column
+prostate_data <- prostate_data[, !colnames(prostate_data) %in% "train"]
+
+# Identify categorical and numercial variables
+categorical_vars <- c("svi", "gleason")
+numerical_vars <- setdiff(colnames(prostate_data), c(categorical_vars, "lpsa"))
+
+# Convert categorical variables to factors
+prostate_data <- prostate_data %>%
+  mutate(across(all_of(categorical_vars), as.factor))
+
+### Exploratory Data Analysis Before Splitting
+
+## Boxplots for numerical vs categorical comparisons
+
+# svi vs. numerical variables
+
+par(mfrow = c(2, 3)) 
+
+svi_colors <- c("No" = "#F8766D", "Yes" = "#00BFC4")  
+
+for (num_var in numerical_vars) {
+  test <- t.test(prostate_data[[num_var]] ~ prostate_data$svi)
+  p_val <- test$p.value
+  
+  p_label <- ifelse(p_val < 0.001, "p-value < 0.001", paste("p-value =", round(p_val, 3)))
+  
+  svi_factor <- factor(prostate_data$svi, levels = c(0, 1), labels = c("No", "Yes"))
+  
+  boxplot(prostate_data[[num_var]] ~ svi_factor, 
+          main = paste(num_var, "by svi\n", p_label),
+          xlab = "svi", ylab = num_var, 
+          col = svi_colors, border = "black")
+}
+```
+
+```{r}
+# gleason vs. numerical variables
+par(mfrow = c(2, 3)) 
+
+gleason_colors <- c("6" = "#F8766D", 
+                    "7" = "#7CAE00",  
+                    "8" = "#00BFC4", 
+                    "9" = "#C77CFF") 
+
+for (num_var in numerical_vars) {
+  anova_model <- aov(prostate_data[[num_var]] ~ prostate_data$gleason)
+  anova_summary <- summary(anova_model)[[1]]
+  p_val <- anova_summary["Pr(>F)"][1,]
+  
+  p_label <- ifelse(p_val < 0.001, "p-value < 0.001", paste("p-value =", round(p_val, 3)))
+  
+  gleason_factor <- factor(prostate_data$gleason, levels = c(6, 7, 8, 9))
+  
+  boxplot(prostate_data[[num_var]] ~ gleason_factor, 
+          main = paste(num_var, "by gleason\n", p_label),
+          xlab = "gleason", ylab = num_var, 
+          col = gleason_colors[as.character(levels(gleason_factor))], 
+          border = "black")
+}
+```
+
+```{r}
+## Correlation matrix to understand numeric variables relationships
+
+cor_matrix <- cor(prostate_data[, numerical_vars], use = "pairwise.complete.obs")
+
+corrplot(
+  cor_matrix, 
+  method = "color", 
+  col = colorRampPalette(c("#bc5090", "white", "#6b85d8"))(200),  
+  tl.col = "black",      
+  tl.srt = 30,           
+  addCoef.col = "black", 
+  cl.pos = "b",          
+  title = "    Correlation Matrix", 
+  mar = c(2, 2, 4, 2),   
+  tl.cex = 1.2,          
+  number.cex = 0.9       
+)
+```
+
+```{r, echo=TRUE, message=FALSE, warning=FALSE, fig.width=7, fig.height=5}
+## Relationship between categorical variables
+
+# Create contingency table
+svi_gleason_table <- table(prostate_data$svi, prostate_data$gleason)
+
+# Perform Chi-Square Test
+chisq_test <- chisq.test(svi_gleason_table)
+chisq_stat <- round(chisq_test$statistic, 3)  # Round Chi-squared statistic
+p_val <- chisq_test$p.value
+p_label <- ifelse(p_val < 0.001, "p-value < 0.001", paste("p-value =", round(p_val, 3)))
+
+# Compute Cramér's V
+cramer_v_value <- CramerV(svi_gleason_table)
+
+# Convert the contingency table into a data frame
+svi_gleason_df <- as.data.frame(as.table(svi_gleason_table))
+colnames(svi_gleason_df) <- c("svi", "gleason", "count")
+
+# Convert categorical variables to factors
+svi_gleason_df$svi <- factor(svi_gleason_df$svi, levels = c(0, 1), labels = c("No", "Yes"))
+svi_gleason_df$gleason <- factor(svi_gleason_df$gleason, levels = c(6, 7, 8, 9))
+
+plot_title <- paste0(
+  "Association Between SVI and Gleason Score\n",
+  "Cramér's V = ", round(cramer_v_value, 3), 
+  " | Chi-sq = ", chisq_stat, " | ", p_label
+)
+
+ggplot(svi_gleason_df, aes(x = gleason, y = svi, fill = count)) +
+  geom_tile(color = "white") +
+  geom_text(aes(label = count), color = "black", size = 6) +
+  scale_fill_gradient(low = "#bc5090", high = "#6b85d8") +
+  labs(title = plot_title, x = "Gleason Score", y = "SVI") +
+  theme_minimal(base_size = 14) +
+  theme(plot.title = element_text(hjust = 0.5)) 
+
+```
+
+```{r, fig.width= 8, fig.height= 1}
+# Check Variance Inflation Factor (VIF) for multicollinearity
+vif_values <- vif(lm(lpsa ~ ., data = prostate_data))
+
+vif_df <- as.data.frame(vif_values)
+vif_df$Feature <- rownames(vif_df)  
+vif_df <- vif_df[, c("Feature", "GVIF")]  
+colnames(vif_df) <- c("Variable", "VIF")  
+
+# Round VIF values for better readability
+vif_df$VIF <- round(vif_df$VIF, 3)
+
+# Transpose the table for a better layout
+vif_transposed <- as.data.frame(t(vif_df[, 2, drop = FALSE])) 
+colnames(vif_transposed) <- vif_df$Variable  
+rownames(vif_transposed) <- "VIF"  # Rename row to "VIF"
+
+# Create a grob table
+vif_table <- tableGrob(vif_transposed, rows = NULL)
+
+# Title
+vif_title <- textGrob("Variance Inflation Factor (VIF)", 
+                      gp = gpar(fontsize = 14, fontface = "bold"))
+
+# Arrange table in a plot
+grid.arrange(vif_title, vif_table, nrow = 2)
+```
+
+```{r}
+### Split data
+set.seed(42) 
+
+prostate_data_split <- initial_split(prostate_data, prop = 0.7, strata = lpsa) 
+train_data <- training(prostate_data_split)
+test_data <- testing(prostate_data_split)
+
+# Standardize numerical features
+preProcess_model <- preProcess(train_data %>% dplyr::select(-svi, -gleason, -lpsa), 
+                               method = c("center", "scale"))
+
+features_train_scaled <- predict(preProcess_model, train_data %>% dplyr::select(-svi, -gleason, -lpsa)) %>%
+  bind_cols(train_data %>% dplyr::select(svi, gleason))
+
+features_test_scaled <- predict(preProcess_model, test_data %>% dplyr::select(-svi, -gleason, -lpsa)) %>%
+  bind_cols(test_data %>% dplyr::select(svi, gleason))
+
+target_train <- train_data$lpsa
+target_test <- test_data$lpsa 
+```
+
+## Feature Selection
+
+::: {style="text-align: justify"}
+`Lasso regression` was used to perform **feature selection** ensuring that only the most relevant predictors are retained while reducing the risk of **overfitting**.
+:::
+
+```{r}
+# LASSO Feature Selection
+set.seed(42)
+lasso_cv <- cv.glmnet(as.matrix(features_train_scaled), target_train, alpha = 1, nfolds = 10)
+best_lambda <- lasso_cv$lambda.1se
+
+lasso_model <- glmnet(as.matrix(features_train_scaled), target_train, alpha = 1, lambda = best_lambda)
+selected_features_lasso <- rownames(coef(lasso_model))[coef(lasso_model)[,1] != 0]
+selected_features_lasso <- setdiff(selected_features_lasso, "(Intercept)")  
+
+cat("Selected Features:\n", paste(selected_features_lasso, collapse = ", "), "\n")
+```
+
+## Model Building
+
+::: {style="text-align: justify"}
+A multiple linear regression model is trained using the features selected by LASSO regression.
+The model is then used to predict the logarithm of PSA levels in the test dataset.
+:::
+
+```{r}
+# Train a linear regression model with selected features
+set.seed(42)
+features_train_selected <- features_train_scaled[, selected_features_lasso]
+features_test_selected <- features_test_scaled[, selected_features_lasso]
+
+lm_model <- lm(lpsa ~ ., data = data.frame(lpsa = target_train, features_train_selected))
+```
+
+## Model Evaluation
+
+::: {style="text-align: justify"}
+The model is evaluated using Root Mean Squared Error (`RMSE`), and Coefficient of Determination (`R²`).
+Additionally, a scatter plot is generated to compare actual versus predicted values.
+:::
+
+```{r, fig.width= 9, fig.height= 6, message= FALSE}
+#Predict on test data
+target_pred <- predict(lm_model, newdata = as.data.frame(features_test_selected))
+
+# Evaluate model performance
+mse <- mean((target_test - target_pred)^2)
+rmse <- sqrt(mse)
+r2 <- summary(lm(target_test ~ target_pred))$r.squared
+
+plot_data <- data.frame(Actual = target_test, Predicted = target_pred)
+
+ggplot(plot_data, aes(x = Actual, y = Predicted)) +
+  geom_point(color = "#6b85d8") +
+  geom_smooth(method = "lm", color = "#6b85d8", fill = "lightblue") +
+  labs(
+    title = "Actual vs Predicted lpsa",
+    x = "Actual lpsa",
+    y = "Predicted lpsa"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(
+    plot.title = element_text(face = "bold", size = 16, hjust = 0.5),
+    axis.title = element_text(face = "bold"),
+    panel.grid = element_blank(),
+    panel.border = element_blank(),
+    axis.line = element_line(color = "black", linewidth = 0.5),
+    axis.ticks = element_line(color = "black", linewidth = 0.5)
+  ) +
+  annotate("text", 
+           x = min(plot_data$Actual) + 0.5, 
+           y = max(plot_data$Predicted) - 0.5, 
+           label = sprintf("R² = %.3f\nRMSE = %.3f", r2, rmse),  
+           size = 5, color = "black", fontface = "bold") 
+```
+
+::: {style="text-align: justify"}
+The `R²` for the model predicting log PSA levels is **0.732**, indicating that 73.2% of the variance in the dependent variable (lpsa) is explained by the selected predictors.
+*This suggests a strong relationship between the independent variables and the response, supporting the model’s effectiveness in capturing key factors influencing PSA levels.* Given that biological data often exhibit inherent variability due to unobserved genetic and environmental influences, an R² of 0.732 is considered highly acceptable in this context.
+Additionally, feature selection via LASSO regression ensured that only the most relevant predictors were retained, reducing overfitting and enhancing model interpretability.
+The `RMSE` of **0.587** further supports the model's predictive accuracy by demonstrating a reasonable deviation between actual and predicted values.
+:::
+
+# Exercise 2
+
+*Use the [breast cancer dataset](data/breast_cancer_data.csv) to train a model that predicts whether a future tumor image (with unknown diagnosis) is a benign or malignant tumor. Try different machine learning algorithms such as:* 
+
+*- KNNs*\
+*- Decision trees*\
+*- Random forest* *- Logistic Regression*
+
+*The breast cancer dataset contains digitized breast cancer image features, and was created by [Dr. William H. Wolberg, W. Nick Street, and Olvi L. Mangasarian](https://archive.ics.uci.edu/ml/datasets/Breast+Cancer+Wisconsin+%28Diagnostic%29). Each row in the data set represents an image of a tumor sample, including the diagnosis (benign or malignant) and several other measurements (nucleus texture, perimeter, area, and more). Diagnosis for each image was conducted by physicians.*
+
+*Do not forget to perform hyperparameter tuning!*\
+*Generate a ROC curve for all the models.*
+
+*You can use as a guide the analysis of this dataset included in the [chapter 5](https://datasciencebook.ca/classification1.html) of the Data Science, A First Introduction Book.* *Additionally, for further information and ideas, you can check [this post](https://www.rebeccabarter.com/blog/2020-03-25_machine_learning/)*
+
+## ML analysis
+
+::: {style="text-align: justify"}
+In order to train a model that predicts whether a future tumor image is **benign** or **malignant**, we will train four different **ML algorithms** using the **Breast Cancer Data set** by using the `tidymodels` framework.
+
+As a first step, we will **split** the data set into **training (80%)** and **testing (20%)** subsets.
+Then, we will create a **5-fold cross-validation** split from our training data, by using the `vfold_cv()` function.
+
+Next, we will define a **single workflow** to **train** the models, perform **hyperparameter tuning**, and **evaluate** their performance.
+This workflow will be applied to each model with its respective **grid of tuning parameters**, taking into account the dataset size and complexity.
+
+Finally, we will compare the models' performance using a **ROC curve** to determine which algorithm performs the **best** for this data set.
+:::
+
+### Data preparation & splitting
+
+```{r}
+data <- read.csv("data/breast_cancer_data.csv", row.names = 1)
+data$X <- NULL
+data <- data %>% mutate(diagnosis = factor(diagnosis, levels = c("B", "M")))
+
+set.seed(42)
+data_split <- initial_split(data, prop = 0.8, strata = diagnosis)
+bc_train <- training(data_split)
+bc_test <- testing(data_split)
+
+set.seed(42)
+cv_folds <- vfold_cv(bc_train, v = 5, strata = diagnosis)
+```
+
+### Recipe and pipeline definition
+
+```{r}
+bc_recipe <- recipe(diagnosis ~ ., data = bc_train) %>%
+  step_normalize(all_predictors()) %>%
+  step_corr(all_predictors(), threshold = 0.9) %>%
+  step_nzv(all_predictors())
+
+pipeline <- function(model_spec, grid, model_name) {
+  workflow <- workflow() %>% 
+    add_recipe(bc_recipe) %>% 
+    add_model(model_spec)
+  
+  ## Hyperparameters Tuning
+  tuned_res <- tune_grid(
+    workflow,
+    resamples = cv_folds,
+    grid = grid,
+    metrics = metric_set(roc_auc, yardstick::accuracy)
+  )
+  best_params <- select_best(tuned_res, metric = "accuracy")
+
+  ## Model Refit
+  final_model <- finalize_workflow(workflow, best_params)
+  final_fit <- last_fit(final_model, data_split)
+  
+  ## Model Evaluation
+  results <- collect_metrics(final_fit)
+  predictions <- collect_predictions(final_fit)
+  
+  conf_mat <- predictions %>%
+    conf_mat(truth = diagnosis, estimate = .pred_class)
+  
+  list(model_name = model_name, results = results, predictions = predictions, confusion_matrix = conf_mat)
+}
+```
+
+### KNNs
+
+::: {style="text-align: justify"}
+In the KNN model, we use a grid to explores different values for the number of neighbors (`k`) , testing values from **1 to 100** in increments of 5.
+
+Given that the dataset contains 569 observations and 31 features, this range allows the model to explore both small and large values of `k`, which balances between overfitting (small `k`) and underfitting (large `k`); to find the optimal number of neighbors.
+:::
+
+```{r}
+knn_spec <- nearest_neighbor(mode = "classification", neighbors = tune()) %>% 
+  set_engine("kknn")
+knn_grid <- tibble(neighbors = seq(from = 1, to = 100, by = 5))
+
+set.seed(42)
+knn_results <- pipeline(knn_spec, knn_grid, "KNN")
+fourfoldplot(knn_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+### Decision tree
+
+::: {style="text-align: justify"}
+In the Decision Tree model, we use a grid to optimize the minimum number of observations required to split a node (`min_n`) and the maximum tree depth (`tree_depth`).
+
+The range of `min_n` from **2 to 50** and of `tree_depth` from **1 to 10** ensures that the tree can adjust to different levels of detail.
+:::
+
+```{r}
+rpart_spec <- decision_tree(min_n = tune(), tree_depth = tune()) %>%
+  set_engine("rpart") %>%
+  set_mode("classification")
+
+rpart_grid <- grid_regular(min_n(range = c(2, 50)), tree_depth(range = c(1, 10)), levels = 10)
+
+set.seed(42)
+rpart_results <- pipeline(rpart_spec, rpart_grid, "Decision Tree")
+fourfoldplot(rpart_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+### Random forest
+
+::: {style="text-align: justify"}
+In the Random Forest model, the grid searches for an optimal ensemble size with `trees` ranging from **500 to 5000**.
+The `mtry` range (**1 to 19**) allows for exploring different levels of randomness in feature selection for each split.
+And the `min_n` range from **2 to 20** helps control the size of each tree, with larger values preventing overly deep trees and thus reducing overfitting.
+:::
+
+```{r}
+rf_spec <- rand_forest(trees = tune(), mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", replace = FALSE) %>%
+  set_mode("classification")
+
+rf_grid <- grid_regular(trees(range = c(500, 5000)), mtry(range = c(1, 19)), min_n(range = c(2, 20)), levels = 4)
+
+set.seed(42)
+rf_results <- pipeline(rf_spec, rf_grid, "Random Forest")
+fourfoldplot(rf_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+### Logistic regression
+
+::: {style="text-align: justify"}
+Finally, in the Logistic Regression model, with 569 observations and 31 features, regularization is crucial to prevent overfitting, especially for **GLMs**.
+The `penalty` range from **0 to 1** explores no regularization (0) to full regularization (1).
+The `mixture` range allows testing a mix between Lasso (**L1 regularization**) and Ridge (**L2 regularization**), with values from 0 (Ridge) to 1 (Lasso), to find the best regularization technique for the dataset.
+:::
+
+```{r}
+glm_spec <- logistic_reg(penalty = tune(), mixture = tune()) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+glm_grid <- grid_regular(penalty(range = c(0, 1)), mixture(range = c(0, 1)), levels = 10)
+
+set.seed(42)
+glm_results <- pipeline(glm_spec, glm_grid, "Logistic Regression")
+fourfoldplot(glm_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+## Results
+
+### ROC curves plot
+
+```{r}
+roc_data <- bind_rows(
+  knn_results$predictions %>% 
+    mutate(Model = paste0("KNN (AUC: ", round(knn_results$results %>%
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")")),
+  rpart_results$predictions %>% 
+    mutate(Model = paste0("Decision tree (AUC: ", round(rpart_results$results %>%
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")")),
+  rf_results$predictions %>%
+    mutate(Model = paste0("Random forest (AUC: ", round(rf_results$results %>% 
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")")),
+  glm_results$predictions %>%
+    mutate(Model = paste0("Logistic regression (AUC: ", round(glm_results$results %>%
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")")))
+
+roc_data %>%
+  mutate(diagnosis = factor(diagnosis, levels = c("B", "M"))) %>%
+  group_by(Model) %>%
+  roc_curve(truth = diagnosis, .pred_M, event_level = "second") %>%
+  autoplot() + 
+  style_roc() +
+  geom_abline(linetype = "dashed", color = "gray")
+```
+
+### Accuracy vs ROC
+
+```{r echo=FALSE}
+acc <- tibble(
+  Model = c("KNN", "Decision Tree", "Random Forest", "Logistic Regression"),
+  Accuracy = c(knn_results$results %>% filter(.metric == "accuracy") %>% pull(.estimate),
+               rpart_results$results %>% filter(.metric == "accuracy") %>% pull(.estimate),
+               rf_results$results %>% filter(.metric == "accuracy") %>% pull(.estimate),
+               glm_results$results %>% filter(.metric == "accuracy") %>% pull(.estimate)),
+  AUC = c(knn_results$results %>% filter(.metric == "roc_auc") %>% pull(.estimate),
+               rpart_results$results %>% filter(.metric == "roc_auc") %>% pull(.estimate),
+               rf_results$results %>% filter(.metric == "roc_auc") %>% pull(.estimate),
+               glm_results$results %>% filter(.metric == "roc_auc") %>% pull(.estimate)))
+formattable(acc, 
+            align = c("l", "c", "c"),
+            list(Accuracy = color_tile("cornsilk", "darkslategray3"),
+                 AUC = color_tile("cornsilk", "darkslategray3")))
+```
+
+## Discussion
+
+::: {style="text-align: justify"}
+*Which of all models performs better for this data? Discuss.*
+
+Overall, all models show strong performance.
+**While Random Forest achieves the highest AUC (0.988), KNN and Decision Tree models have the higher accuracy, due to its lower FP and FN fractions.**
+
+Accuracy is highly dependent on the decision threshold used for classification, whereas AUC provides a better assessment of a model’s ability to discriminate between classes across multiple thresholds.
+So, a model with lower FP and FN at a single threshold may achieve higher accuracy but might not necessarily have the best overall classification ability.
+
+-   KNN and Decision Tree models may be making more conservative predictions, reducing misclassifications at a fixed threshold.
+    However, this does not ensure generalization across different thresholds, which could explain their lower AUC.
+
+-   In contrast, Random Forest benefits from increased robustness and classification performance across different thresholds.
+    Although it may produce more FP or FN at a specific threshold, its ability to rank positive instances higher than negative ones contributes to its higher AUC performance.
+
+Taking into account that in this analysis model performance was assessed using the default threshold, **we can conclude that based on the ROC metric the best-performing model for this data set is Random Forest**.
+:::
+
+# Exercise 3
+
+*Use [The Cancer Genome Atlas (TCGA)](https://www.genome.gov/Funded-Programs-Projects/Cancer-Genome-Atlas) gene expression data of two different cancer types to build a machine learning model that identifies whether a given sample (gene counts) belongs to one or the other.* *The TCGA is a comprehensive and coordinated effort to accelerate our understanding of the molecular basis of cancer through the application of genome analysis technologies, including large-scale genome sequencing.* *The program has generated, analyzed, and made available genomic sequence, expression, methylation, and copy number variation data on over 11,000 individuals who represent over 30 different types of cancer.* *After building your model, you should predict the cancer types for [10 unkwnon samples](data/unknwown_samples.tsv).*
+
+*For this task, you should retrieve the TCGA data from the [Genomic Data Commons Data Portal](https://portal.gdc.cancer.gov/).* *If necessary you can watch [the video uploaded in the Campus Global](https://aulaglobal.upf.edu/mod/resource/view.php?id=1483539).* *The video assumes that you have previously installed the [GDC data transfer tool](https://gdc.cancer.gov/access-data/gdc-data-transfer-tool).*
+
+*Each team will work with two specific cancer types, that will be assigned in class.*
+
+*Important notice: if you do not have a lot of hard drive space in your laptop, you can modify the manifest file to download only 50 samples per cancer types.*
+
+## Data preparation
+
+::: {style="text-align: justify"}
+This section focuses on data preparation by retrieving and structuring gene expression data from TCGA for two cancer types: LAML and KIRC.
+The `prepare_data()` function systematically loads gene expression files, extracts relevant data, and removes unnecessary metadata.
+Each sample is assigned a unique identifier, and gene expression values are averaged to ensure consistency.
+The processed data from both cancer types is then merged into a single dataset, aligning gene names and expression values across samples.
+For this analysis, we use the TPM values of each sample, as this measure is the most suitable for RNA-seq comparisons between samples.
+:::
+
+```{r}
+prepare_data <- function(tcga_path, start_index = 1) {
+  folders <- list.dirs(tcga_path, recursive = FALSE)
+  files_list <- lapply(folders, function(folder) {
+    list.files(folder, pattern = "gene_counts.tsv$", recursive = TRUE, full.names = TRUE)
+  })
+
+  merged_df <- NULL
+  for (i in seq_along(files_list)) {
+    df <- as.data.frame(read_tsv(files_list[[i]], comment = "#", col_names = TRUE, show_col_types = FALSE))
+    df <- df[-c(1, 2, 3, 4), ]
+    df <- df[, c("gene_name", "tpm_unstranded")]
+    
+    colnames(df) <- c("gene_name", paste0("sample", start_index + i))  # Adjust sample names
+    
+    df <- df %>%
+      group_by(gene_name) %>%
+      summarise(across(where(is.numeric), ~ mean(.x, na.rm = TRUE)), .groups = "drop")
+
+    if (is.null(merged_df)) {
+      merged_df <- df
+    } else {
+      merged_df <- full_join(merged_df, df, by = "gene_name")
+    }
+  }
+  return(merged_df)
+}
+
+laml_data <- prepare_data("data/TCGA/LAML", start_index = 1)   
+kirc_data <- prepare_data("data/TCGA/KIRC", start_index = 152)  
+merged_data <- full_join(laml_data, kirc_data, by = "gene_name")
+
+data <- as.data.frame(t(merged_data[,-1]))  
+colnames(data) <- merged_data$gene_name     
+dim(data)
+
+data$type <- rep(c("LAML", "KIRC"), times = c(150, 150))
+data <- data %>%
+  relocate(type)
+```
+
+## Data Splitting and Feature Selection
+
+::: {style="text-align: justify"}
+The dataset is split into training (**70%**) and testing (**30%**) sets.
+To enhance model performance, `feature selection` is applied by calculating the variance of each gene's expression within the training set, as genes with higher variance are more likely to carry discriminative information.
+The `top 25 genes` with the highest variance are selected, reducing dimensionality while preserving relevant features.
+Finally, `10-fold cross-validation` is established, allowing for robust model evaluation by iteratively training and testing on different data subsets, thereby reducing overfitting and improving generalizability.
+:::
+
+```{r}
+set.seed(42)
+data_split <- initial_split(data, prop = 0.7, strata = type)
+tcga_train <- training(data_split)
+tcga_test <- testing(data_split)
+
+
+gene_variances <- apply(tcga_train[, -1], 2, var, na.rm = TRUE)
+
+# Select the top 25 genes with the highest variance
+selected_genes <- names(sort(gene_variances, decreasing = TRUE))[1:25]
+
+# Keep only selected genes in both train and test sets
+tcga_train <- tcga_train %>%
+  dplyr::select(type, all_of(selected_genes))
+
+tcga_test <- tcga_test %>%
+  dplyr::select(type, all_of(selected_genes))
+
+set.seed(42)
+cv_folds <- vfold_cv(tcga_train, v = 10, strata = type)
+```
+
+## Recipe and pipeline definition
+
+::: {style="text-align: justify"}
+The `tcga_recipe` applies, first, **normalization** to scale all features to ensure they are on a comparable scale.
+Then, **highly correlated features are removed**, preventing redundancy and multicollinearity.
+**Near-zero variance filtering** eliminates genes that show little variation across samples, as they contribute minimally to classification.
+Finally, **PCA** is applied to reduce dimensionality while retaining 90% of the variance, improving efficiency and reducing overfitting risks.
+The `pipeline()` function integrates this preprocessing with any model, performing **hyperparameter tuning**, **model selection**, and **evaluation** using cross-validation.
+It identifies the best parameters, refits the model, and collects performance metrics.
+:::
+
+```{r}
+tcga_recipe <- recipe(type ~ ., data = tcga_train) %>%
+  step_normalize(all_predictors()) %>%
+  step_corr(all_predictors(), threshold = 0.8) %>%
+  step_nzv(all_predictors(), freq_cut = 95/5, unique_cut = 10) %>%  
+  step_pca(all_predictors(), threshold = 0.9)
+
+
+pipeline <- function(model_spec, grid, model_name) {
+  workflow <- workflow() %>% 
+    add_recipe(tcga_recipe) %>% 
+    add_model(model_spec)
+  
+  ## Hyperparameters Tuning
+  tuned_res <- tune_grid(
+    workflow,
+    resamples = cv_folds,
+    grid = grid,
+    metrics = metric_set(roc_auc, yardstick::accuracy)
+  )
+  best_params <- select_best(tuned_res, metric = "accuracy")
+
+  ## Model Refit
+  final_model <- finalize_workflow(workflow, best_params)
+  final_fit <- last_fit(final_model, data_split)
+  
+  ## Model Evaluation
+  results <- collect_metrics(final_fit)
+  predictions <- collect_predictions(final_fit)
+  
+  conf_mat <- predictions %>%
+    conf_mat(truth = type, estimate = .pred_class)
+  
+  list(model_name = model_name, results = results, predictions = predictions, confusion_matrix = conf_mat, final_model = final_fit)
+}
+```
+
+## Random forest
+
+::: {style="text-align: justify"}
+We decided to build a Random Forest model, as it have been widely used and perform well on gene expression datasets.
+It also works well with high-dimensional data and handles non-linearity and interactions between genes.
+
+The **Random Forest classifier** is used for cancer type prediction, with hyperparameters optimized through grid search to balance performance, generalization, and efficiency.
+The number of trees (`50–300`) ensures stability without excessive computation, while limiting the number of features per split (`1–3`) helps prevent overfitting, given the small gene set.
+A minimum node size of `50–150` prevents overly deep splits that could capture noise rather than meaningful patterns.
+Using 80% of the data per tree introduces randomness, improving generalization.
+The `ranger` engine was chosen for its speed and built-in feature importance metrics, ensuring the model remains accurate, interpretable, and robust for predicting unseen cancer samples.
+:::
+
+```{r}
+rf_spec <- rand_forest(trees = tune(), mtry = tune(), min_n = tune()) %>%
+  set_engine("ranger", importance = "impurity", replace = FALSE, sample.fraction = 0.8) %>%
+  set_mode("classification")
+
+rf_grid <- grid_regular(
+  trees(range = c(50, 300)),  
+  mtry(range = c(1, 3)),      
+  min_n(range = c(50, 150)),
+  levels = 4
+)
+
+set.seed(42)
+rf_results <- pipeline(rf_spec, rf_grid, "Random Forest")
+fourfoldplot(rf_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+::: {style="text-align: justify"}
+The Random Forest model performs exceptionally well in distinguishing LAML and KIRC cancer types, with a very low error rate.
+:::
+
+## Logistic regression
+
+::: {style="text-align: justify"}
+As a second model, Logistic Regression is a good option, particularly because it is well-suited for binary classification, which is the type of problem we are dealing with.
+
+The **Logistic Regression classifier** is implemented for cancer type prediction.
+The penalty term (`0.01–10, log-scaled`) controls the strength of regularization, preventing overfitting while maintaining predictive accuracy.
+The elastic net mixing parameter (`0–1`) determines the balance between L1 (lasso) and L2 (ridge) regularization, enabling both feature selection and coefficient shrinkage.
+A more granular grid search (`10 levels`) ensures optimal tuning of these hyperparameters.
+The `glmnet` engine was chosen for its computational efficiency and ability to handle high-dimensional gene expression data, making it well-suited for this classification task.
+:::
+
+```{r}
+glm_spec <- logistic_reg(
+  penalty = tune(),  
+  mixture = tune()   
+) %>%
+  set_engine("glmnet") %>%
+  set_mode("classification")
+
+glm_grid <- grid_regular(
+  penalty(range = c(0.01, 10), trans = log10_trans()),  
+  mixture(range = c(0, 1)), 
+  levels = 10  
+)
+
+set.seed(42)
+glm_results <- pipeline(glm_spec, glm_grid, "Logistic Regression")
+fourfoldplot(glm_results$confusion_matrix$table, color=c("#e0938d","#9ed7ab"))
+```
+
+::: {style="text-align: justify"}
+The Logistic Regression model performs exceptionally well in distinguishing LAML and KIRC cancer types, with a very low error rate.
+:::
+
+## ROC curves
+
+::: {style="text-align: justify"}
+**ROC curves** and **AUC scores** were used to evaluate the classification performance of the Logistic Regression and Random Forest models.
+Both models, Logistic Regression (**AUC: 0.988**) and Random Forest (**AUC: 0.976**), demonstrate excellent discrimination.
+:::
+
+```{r}
+roc_data <- bind_rows(
+  rf_results$predictions %>%
+    mutate(Model = paste0("Random Forest (AUC: ", round(rf_results$results %>%
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")")),
+  glm_results$predictions %>%
+    mutate(Model = paste0("Logistic Regression (AUC: ", round(glm_results$results %>%
+    filter(.metric == "roc_auc") %>% pull(.estimate), 3), ")"))
+)
+
+roc_data %>%
+  mutate(type = factor(type, levels = c("LAML", "KIRC"))) %>%
+  group_by(Model) %>%
+  roc_curve(truth = type, .pred_KIRC, event_level = "second") %>%
+  autoplot() + 
+  style_roc() +
+  geom_abline(linetype = "dashed", color = "gray")
+```
+
+## Predict Cancer Type for 10 Unlabeled Samples
+
+### Prediction using the Logistic Regression Model
+
+::: {style="text-align: justify"}
+This section predicts the cancer type for 10 unknown samples using both the Logistic Regression and Random Forest models, as they achieved similar AUC values (Logistic Regression: 0.988, Random Forest: 0.976).
+The unknown samples are **preprocessed** to match the training format, retaining only the selected 25 genes and reshaping the data for prediction.
+**Each model then generates cancer type classifications along with their probability scores for KIRC and LAML.** Running both models allows us to validate consistency in predictions, ensuring classification reliability.
+:::
+
+```{r}
+# Load unknown samples
+unknown_samples <- read_tsv("data/unknwown_samples.tsv", show_col_types = FALSE)
+
+# Process the unknown samples
+unknown_processed <- unknown_samples %>%
+  dplyr::select(gene_name, starts_with("individual_")) %>%
+  filter(gene_name %in% selected_genes) %>%
+  pivot_longer(cols = starts_with("individual_"), 
+               names_to = "sample_id", 
+               values_to = "expression") %>%
+  pivot_wider(names_from = gene_name, values_from = expression) %>%
+  relocate(sample_id)  
+
+# Extract the fitted model from the workflow
+final_workflow <- glm_results$final_model$.workflow[[1]]
+
+# Make predictions
+predictions <- predict(final_workflow, new_data = unknown_processed, type = "class")
+probabilities <- predict(final_workflow, new_data = unknown_processed, type = "prob")
+
+# Combine results with sample IDs
+prediction_results <- bind_cols(
+  sample_id = unknown_processed$sample_id,
+  predicted_type = predictions$.pred_class,
+  probabilities
+)
+
+colnames(prediction_results) <- c("Sample ID", "Predicted Cancer Type", "Probability KIRC", "Probability LAML")
+
+results <- prediction_results %>%
+  mutate(`Sample ID` = gsub("individual_", "Individual ", `Sample ID`))
+
+kable(results, caption = "Cancer Type Predictions (Using Logsitic Regression Model)", align = "c", "pipe")
+```
+
+### Prediction using the Random Forest Model
+
+```{r}
+# Load unknown samples
+unknown_samples <- read_tsv("data/unknwown_samples.tsv", show_col_types = FALSE)
+
+# Process the unknown samples
+unknown_processed <- unknown_samples %>%
+  dplyr::select(gene_name, starts_with("individual_")) %>%
+  filter(gene_name %in% selected_genes) %>%
+  pivot_longer(cols = starts_with("individual_"), 
+               names_to = "sample_id", 
+               values_to = "expression") %>%
+  pivot_wider(names_from = gene_name, values_from = expression) %>%
+  relocate(sample_id)  # Ensure sample_id is the first column
+
+# Extract the fitted model from the workflow
+final_workflow <- rf_results$final_model$.workflow[[1]]
+
+# Make predictions
+predictions <- predict(final_workflow, new_data = unknown_processed, type = "class")
+probabilities <- predict(final_workflow, new_data = unknown_processed, type = "prob")
+
+# Combine results with sample IDs
+prediction_results <- bind_cols(
+  sample_id = unknown_processed$sample_id,
+  predicted_type = predictions$.pred_class,
+  probabilities
+)
+
+colnames(prediction_results) <- c("Sample ID", "Predicted Cancer Type", "Probability KIRC", "Probability LAML")
+
+results <- prediction_results %>%
+  mutate(`Sample ID` = gsub("individual_", "Individual ", `Sample ID`))
+
+kable(results, caption = "Cancer Type Predictions (Using Random Forest Model)", align = "c", "pipe")
+```
+
+::: {style="text-align: justify"}
+The results indicate that both models predict similar outcomes for most individuals in the dataset. Both models classify Individual 6 as belonging to the LAML category, while the remaining individuals are predominantly classified as KIRC. However, a key difference emerges in the case of Individual 10, where the Random Forest model classifies the sample as LAML, whereas Logistic Regression predicts it as KIRC. This inconsistency suggests that the classification of Individual 10 may be ambiguous, requiring further validation through additional data or more refined models.
+Random Forest produces highly confident predictions, with most probabilities exceeding **0.80**, meaning the model is very certain about its classifications.
+Logistic Regression, in contrast, provides more moderate probability scores, with values closer to **0.50** in several cases, suggesting less confidence in distinguishing between LAML and KIRC.
+**A key limitation of this classification is that the models were trained exclusively on two cancer types, while in reality, there are many more cancer types. This means that the models cannot recognize other potential cancers and must force every sample into one of the two available classes.** This explains why some probability values in Logistic Regression are close to 0.50, indicating the model struggles to confidently assign a type.
+If any of these individuals belong to a different cancer type, the models will still classify them as either KIRC or LAML, even if they are biologically different.
+Even so, we could speculate that **Individual 6** sample is truly from LAML cancer-type based on both ML models classification.
+:::
+
+# session info {.unnumbered}
+
+```{r, results='asis',  echo=FALSE, message=FALSE }
+sessionInfo()
+```
